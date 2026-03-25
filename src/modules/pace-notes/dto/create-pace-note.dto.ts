@@ -1,10 +1,10 @@
 import {
+  IsBoolean,
   IsEnum,
   IsNumber,
   IsOptional,
   IsString,
   IsUUID,
-  IsNotEmpty,
 } from 'class-validator';
 
 export type PaceNoteType = 'curve' | 'straight';
@@ -67,6 +67,14 @@ export class CreatePaceNoteDto {
   @IsNumber()
   @IsOptional()
   noteGapRight?: number;
+
+  @IsUUID()
+  @IsOptional()
+  groupId?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  pageBreakAfter?: boolean;
 
   @IsNumber()
   lat: number;

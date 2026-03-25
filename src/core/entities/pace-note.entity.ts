@@ -58,6 +58,12 @@ export class PaceNoteEntity {
   @Column({ name: 'note_gap_right', type: 'int', nullable: true })
   noteGapRight: number;
 
+  @Column({ name: 'group_id', type: 'uuid', nullable: true })
+  groupId: string | null;
+
+  @Column({ name: 'page_break_after', type: 'boolean', default: false })
+  pageBreakAfter: boolean;
+
   @Transform(({ value }) => Number(value))
   @Column({ type: 'decimal' })
   lat: number;

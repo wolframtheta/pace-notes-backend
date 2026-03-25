@@ -9,6 +9,7 @@ import { StageEntity } from '../../core/entities/stage.entity';
 import { RalliesService } from '../rallies/rallies.service';
 import { CreateStageDto } from './dto/create-stage.dto';
 import { UpdateStageDto } from './dto/update-stage.dto';
+import { NoteGroupsService } from '../note-groups/note-groups.service';
 
 @Injectable()
 export class StagesService {
@@ -16,6 +17,7 @@ export class StagesService {
     @InjectRepository(StageEntity)
     private readonly stagesRepository: Repository<StageEntity>,
     private readonly ralliesService: RalliesService,
+    private readonly noteGroupsService: NoteGroupsService,
   ) {}
 
   async findByRally(rallyId: string, userId: string): Promise<StageEntity[]> {
@@ -52,6 +54,7 @@ export class StagesService {
 
   async remove(id: string, userId: string): Promise<void> {
     const stage = await this.findOneScoped(id, userId);
+    await this.noteGroupsService.removeByStage(stage.id);
     await this.stagesRepository.delete(stage.id);
   }
 }

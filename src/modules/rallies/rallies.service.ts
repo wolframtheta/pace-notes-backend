@@ -9,6 +9,7 @@ import { RallyEntity } from '../../core/entities/rally.entity';
 import { PaceNoteEntity } from '../../core/entities/pace-note.entity';
 import { CreateRallyDto } from './dto/create-rally.dto';
 import { UpdateRallyDto } from './dto/update-rally.dto';
+import { NoteGroupsService } from '../note-groups/note-groups.service';
 
 @Injectable()
 export class RalliesService {
@@ -17,6 +18,7 @@ export class RalliesService {
     private readonly ralliesRepository: Repository<RallyEntity>,
     @InjectRepository(PaceNoteEntity)
     private readonly paceNotesRepository: Repository<PaceNoteEntity>,
+    private readonly noteGroupsService: NoteGroupsService,
   ) {}
 
   async findAllByUser(userId: string): Promise<(RallyEntity & { stageCount: number })[]> {
@@ -58,9 +60,10 @@ export class RalliesService {
   async remove(id: string, userId: string): Promise<void> {
     const rally = await this.findOne(id, userId);
 
-    // Cascade delete pace notes for all stages in the rally
+    // Cascade delete pace notes and note groups for all stages in the rally
     for (const stage of rally.stages ?? []) {
       await this.paceNotesRepository.delete({ stageId: stage.id });
+      await this.noteGroupsService.removeByStage(stage.id);
     }
 
     await this.ralliesRepository.delete(rally.id);
