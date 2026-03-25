@@ -76,6 +76,10 @@ export class CreatePaceNoteDto {
   @IsOptional()
   pageBreakAfter?: boolean;
 
+  @IsBoolean()
+  @IsOptional()
+  fasterCall?: boolean;
+
   @IsNumber()
   lat: number;
 

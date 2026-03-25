@@ -64,6 +64,10 @@ export class PaceNoteEntity {
   @Column({ name: 'page_break_after', type: 'boolean', default: false })
   pageBreakAfter: boolean;
 
+  /** Impressió / pilot: dir aquesta nota més ràpid (ralla vertical vermella) */
+  @Column({ name: 'faster_call', type: 'boolean', default: false })
+  fasterCall: boolean;
+
   @Transform(({ value }) => Number(value))
   @Column({ type: 'decimal' })
   lat: number;
