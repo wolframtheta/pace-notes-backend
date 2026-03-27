@@ -22,4 +22,19 @@ export class UsersService {
     const user = this.usersRepository.create({ email, password: hashedPassword, name });
     return this.usersRepository.save(user);
   }
+
+  async findByRefreshTokenHash(hash: string): Promise<UserEntity | null> {
+    return this.usersRepository.findOne({ where: { refreshTokenHash: hash } });
+  }
+
+  async updateRefreshToken(
+    userId: string,
+    hash: string | null,
+    expiresAt: Date | null,
+  ): Promise<void> {
+    await this.usersRepository.update(userId, {
+      refreshTokenHash: hash,
+      refreshTokenExpiresAt: expiresAt,
+    });
+  }
 }

@@ -10,6 +10,7 @@ import { PaceNotesModule } from './modules/pace-notes/pace-notes.module';
 import { NoteConfigsModule } from './modules/note-configs/note-configs.module';
 import { RalliesModule } from './modules/rallies/rallies.module';
 import { NoteGroupsModule } from './modules/note-groups/note-groups.module';
+import { GeocodingModule } from './modules/geocoding/geocoding.module';
 
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { NoteGroupsModule } from './modules/note-groups/note-groups.module';
     PaceNotesModule,
     NoteConfigsModule,
     NoteGroupsModule,
+    GeocodingModule,
   ],
   providers: [SeederService],
 })
