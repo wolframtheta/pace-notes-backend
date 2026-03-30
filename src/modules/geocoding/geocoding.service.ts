@@ -4,7 +4,14 @@ import {
   HttpStatus,
   Logger,
 } from '@nestjs/common';
-import { lineString, length, along, center } from '@turf/turf';
+import {
+  lineString,
+  length,
+  along,
+  center,
+  nearestPointOnLine,
+  point,
+} from '@turf/turf';
 import type { Feature, LineString, Position } from 'geojson';
 
 /** Tolerància ~1 m per considerar que dos nodes OSM coincideixen (junction entre ways). */
@@ -20,7 +27,7 @@ const NOMINATIM_URL = 'https://nominatim.openstreetmap.org/search';
 export interface RoadPointResult {
   lat: number;
   lng: number;
-  source: 'overpass' | 'nominatim';
+  source: 'overpass' | 'overpass_milestone' | 'nominatim';
   /** PK des d’OSM és aproximat respecte al punt quilomètric oficial. */
   approximate: boolean;
   detail?: string;
@@ -30,6 +37,19 @@ interface OverpassWayElement {
   type: string;
   geometry?: Array<{ lon: number; lat: number }>;
 }
+
+interface OverpassNodeElement {
+  type: string;
+  lat?: number;
+  lon?: number;
+  tags?: Record<string, string>;
+}
+
+/** Distància màxima (km) de la fita a la línia OSM per acceptar-la. */
+const MILESTONE_MAX_OFFSET_KM = 2;
+
+/** Mínim de fites vàlides per calibrar PK per interpolació. */
+const MILESTONE_MIN_CALIBRATION = 2;
 
 @Injectable()
 export class GeocodingService {
@@ -79,18 +99,255 @@ export class GeocodingService {
     const line = await this.fetchMergedRoadCenterline(ref, bbox);
     if (!line) return null;
 
-    const lenKm = length(line, { units: 'kilometers' });
-    const dist = Math.min(km, Math.max(0, lenKm - 1e-9));
-    const pt = along(line, dist, { units: 'kilometers' });
+    const milestone = await this.tryPkCalibratedWithMilestones(ref, km, line, bbox);
+    if (milestone) return milestone;
+
+    return this.rawAlongLineFromKm(line, km);
+  }
+
+  /**
+   * Calibra el PK amb nodes highway=milestone (etiqueta distance + ref): orientació de la línia
+   * i chainage per interpolació. Més proper al PK oficial que `along(línia, km)` des de l’extrem OSM.
+   */
+  private async tryPkCalibratedWithMilestones(
+    ref: string,
+    km: number,
+    line: Feature<LineString>,
+    bbox: string,
+  ): Promise<RoadPointResult | null> {
+    const raw = await this.fetchMilestoneCalibration(ref, bbox);
+    if (raw.length < MILESTONE_MIN_CALIBRATION) {
+      return null;
+    }
+
+    let workLine = line;
+    let pairs = this.projectMilestonesOnLine(workLine, raw);
+    if (pairs.length < MILESTONE_MIN_CALIBRATION) {
+      return null;
+    }
+
+    if (this.pkChainageCorrelationNegative(pairs)) {
+      workLine = this.reverseLineString(workLine);
+      pairs = this.projectMilestonesOnLine(workLine, raw);
+      if (pairs.length < MILESTONE_MIN_CALIBRATION) {
+        return null;
+      }
+    }
+
+    const byPk = this.averageChainageByPk(pairs);
+    const sorted = [...byPk.entries()]
+      .map(([pk, c]) => ({ pk, c }))
+      .sort((a, b) => a.pk - b.pk);
+
+    const lenKm = length(workLine, { units: 'kilometers' });
+    const chainageKm = this.interpolateChainageKm(sorted, km, lenKm);
+    const clamped = Math.min(Math.max(chainageKm, 0), Math.max(lenKm - 1e-9, 0));
+    const pt = along(workLine, clamped, { units: 'kilometers' });
     const [lng, lat] = pt.geometry.coordinates;
 
     return {
       lat,
       lng,
+      source: 'overpass_milestone',
+      approximate: true,
+      detail: `PK ~${km} km (calibrat amb ${sorted.length} fita(es) OSM sobre la línia; longitud traç ~${lenKm.toFixed(2)} km).`,
+    };
+  }
+
+  private rawAlongLineFromKm(line: Feature<LineString>, km: number): RoadPointResult {
+    const lenKm = length(line, { units: 'kilometers' });
+    const dist = Math.min(km, Math.max(0, lenKm - 1e-9));
+    const pt = along(line, dist, { units: 'kilometers' });
+    const [lng, lat] = pt.geometry.coordinates;
+    return {
+      lat,
+      lng,
       source: 'overpass',
       approximate: true,
-      detail: `PK ~${km} km mesurat al llarg de la carretera OSM fusionada (longitud total ~${lenKm.toFixed(2)} km).`,
+      detail: `PK ~${km} km al llarg del traç OSM (~${lenKm.toFixed(2)} km). Sense prou fites PK mapades; orientació des de l’extrem de la línia fusionada.`,
     };
+  }
+
+  private reverseLineString(feat: Feature<LineString>): Feature<LineString> {
+    const coords = [...feat.geometry.coordinates].reverse();
+    return lineString(coords);
+  }
+
+  private parseMilestoneDistanceTag(v: string | undefined): number | undefined {
+    if (v === undefined || v === null) return undefined;
+    const s = String(v).trim().replace(',', '.');
+    const m = s.match(/^([\d.]+)/);
+    if (!m) return undefined;
+    const n = parseFloat(m[1]);
+    return Number.isNaN(n) || n < 0 ? undefined : n;
+  }
+
+  /** ref de cerca (p.ex. C-16) vs etiqueta ref OSM (pot ser "C-16; C-55"). */
+  private refMatchesMilestone(refQuery: string, refTag: string | undefined): boolean {
+    if (!refTag?.trim()) return false;
+    const q = refQuery.trim().toUpperCase().replace(/\s+/g, '');
+    const parts = refTag.split(/[;/|]/).map((p) => p.trim().toUpperCase().replace(/\s+/g, ''));
+    return parts.some((p) => p === q);
+  }
+
+  private async fetchMilestoneCalibration(
+    ref: string,
+    bbox: string,
+  ): Promise<Array<{ lat: number; lng: number; pk: number }>> {
+    const data = await this.runOverpassMilestones(ref, bbox);
+    const elements = (data?.elements ?? []) as OverpassNodeElement[];
+    const out: Array<{ lat: number; lng: number; pk: number }> = [];
+
+    for (const el of elements) {
+      if (el.type !== 'node' || el.lat === undefined || el.lon === undefined) continue;
+      const tags = el.tags ?? {};
+      const pk = this.parseMilestoneDistanceTag(tags.distance ?? tags.pk);
+      if (pk === undefined) continue;
+      const refTag = tags.ref ?? tags.nat_ref;
+      if (!this.refMatchesMilestone(ref, refTag)) continue;
+      out.push({ lat: el.lat, lng: el.lon, pk });
+    }
+
+    return out;
+  }
+
+  private projectMilestonesOnLine(
+    line: Feature<LineString>,
+    raw: Array<{ lat: number; lng: number; pk: number }>,
+  ): Array<{ pk: number; chainageKm: number }> {
+    const pairs: Array<{ pk: number; chainageKm: number }> = [];
+    for (const m of raw) {
+      const np = nearestPointOnLine(line, point([m.lng, m.lat]), {
+        units: 'kilometers',
+      });
+      const offset = np.properties.dist ?? np.properties.pointDistance;
+      if (offset !== undefined && offset > MILESTONE_MAX_OFFSET_KM) {
+        continue;
+      }
+      const loc = np.properties.location;
+      if (typeof loc !== 'number' || loc < 0) continue;
+      pairs.push({ pk: m.pk, chainageKm: loc });
+    }
+    return pairs;
+  }
+
+  private pkChainageCorrelationNegative(
+    pairs: Array<{ pk: number; chainageKm: number }>,
+  ): boolean {
+    if (pairs.length < 2) return false;
+    const meanPk =
+      pairs.reduce((s, p) => s + p.pk, 0) / pairs.length;
+    const meanC =
+      pairs.reduce((s, p) => s + p.chainageKm, 0) / pairs.length;
+    let num = 0;
+    let denPk = 0;
+    let denC = 0;
+    for (const p of pairs) {
+      const dp = p.pk - meanPk;
+      const dc = p.chainageKm - meanC;
+      num += dp * dc;
+      denPk += dp * dp;
+      denC += dc * dc;
+    }
+    const denom = Math.sqrt(denPk) * Math.sqrt(denC);
+    if (denom < 1e-12) return false;
+    return num / denom < 0;
+  }
+
+  /** Mitjana de chainage per mateix PK (diverses fites al mateix valor). */
+  private averageChainageByPk(
+    pairs: Array<{ pk: number; chainageKm: number }>,
+  ): Map<number, number> {
+    const acc = new Map<number, { sum: number; n: number }>();
+    for (const p of pairs) {
+      const cur = acc.get(p.pk) ?? { sum: 0, n: 0 };
+      cur.sum += p.chainageKm;
+      cur.n += 1;
+      acc.set(p.pk, cur);
+    }
+    const out = new Map<number, number>();
+    for (const [pk, { sum, n }] of acc) {
+      out.set(pk, sum / n);
+    }
+    return out;
+  }
+
+  private interpolateChainageKm(
+    sorted: Array<{ pk: number; c: number }>,
+    targetPk: number,
+    lineLenKm: number,
+  ): number {
+    if (sorted.length === 0) return 0;
+    if (sorted.length === 1) {
+      const { pk, c } = sorted[0];
+      if (pk <= 1e-9) return Math.min(Math.max(targetPk, 0), lineLenKm);
+      const ratio = targetPk / pk;
+      return Math.min(Math.max(ratio * c, 0), lineLenKm);
+    }
+
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+
+    if (targetPk <= first.pk) {
+      if (sorted.length >= 2) {
+        const b = sorted[1];
+        const slope = (b.c - first.c) / (b.pk - first.pk || 1e-9);
+        return Math.min(Math.max(first.c + slope * (targetPk - first.pk), 0), lineLenKm);
+      }
+      const slope = first.pk > 1e-9 ? first.c / first.pk : 0;
+      return Math.min(Math.max(slope * targetPk, 0), lineLenKm);
+    }
+
+    if (targetPk >= last.pk) {
+      if (sorted.length >= 2) {
+        const prev = sorted[sorted.length - 2];
+        const slope = (last.c - prev.c) / (last.pk - prev.pk || 1e-9);
+        return Math.min(Math.max(last.c + slope * (targetPk - last.pk), 0), lineLenKm);
+      }
+      return Math.min(last.c, lineLenKm);
+    }
+
+    for (let i = 0; i < sorted.length - 1; i++) {
+      const a = sorted[i];
+      const b = sorted[i + 1];
+      if (targetPk >= a.pk && targetPk <= b.pk) {
+        const t = (targetPk - a.pk) / (b.pk - a.pk || 1e-9);
+        return a.c + t * (b.c - a.c);
+      }
+    }
+
+    return Math.min(Math.max(targetPk, 0), lineLenKm);
+  }
+
+  private async runOverpassMilestones(
+    ref: string,
+    bbox: string,
+  ): Promise<{ elements: unknown[] }> {
+    const escaped = ref.replace(/[\\^$*+?.()|[\]{}]/g, '\\$&');
+    const query = `
+[out:json][timeout:60];
+(
+  node["highway"="milestone"]["ref"~"${escaped}",i](${bbox});
+  node["highway"="milestone"]["nat_ref"~"${escaped}",i](${bbox});
+);
+out;
+`.trim();
+
+    try {
+      const res = await fetch(OVERPASS_URL, {
+        method: 'POST',
+        body: query,
+        headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      });
+      if (!res.ok) {
+        this.logger.warn(`Overpass milestones HTTP ${res.status}`);
+        return { elements: [] };
+      }
+      return (await res.json()) as { elements: unknown[] };
+    } catch (e) {
+      this.logger.warn(`Overpass milestones error: ${e}`);
+      return { elements: [] };
+    }
   }
 
   private async tryOverpassCenter(
